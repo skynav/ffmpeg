@@ -472,11 +472,8 @@ static int config_input(AVFilterLink *inlink)
         {
             DIR *dir;
 
-            av_log(ctx, AV_LOG_WARNING, "Diectory type: %d (%s)\n", st.st_mode, url);
-
             if (url && !chdir(url))
             {
-            av_log(ctx, AV_LOG_WARNING, "in diectory: (%s)\n", url);
                 if ((dir = opendir(url)))
                 {
                     struct dirent *xml = NULL;
@@ -492,9 +489,6 @@ static int config_input(AVFilterLink *inlink)
                         sprintf(path, "%s/%s", url, xml->d_name);
 
                         url = path;
-
-                        av_log(ctx, AV_LOG_WARNING, "will load: %s\n", url);
-
                         break;
                     }
                     closedir(dir);
@@ -643,14 +637,14 @@ static void ttpi_blend_frame(
         {
             for (k = 0; k < w; k++) /* columns */
             {
-                a = src[3] + j * src_linesize[3] + k;
-                s = src[i] + (      j >> shift) * src_linesize[i] + (k       >> shift);
+                a = src[3] + (      j         ) * src_linesize[3] + ( k              );
+                s = src[i] + (      j >> shift) * src_linesize[i] + ( k      >> shift);
                 d = dst[i] + ((j + y) >> shift) * dst_linesize[i] + ((k + x) >> shift);
 
                 if (*a == 0xff) /* opaque */
                     *d = *s;
-                else                                  
-                    *d = ((255 - *a) * *d + *a * *s) >> 8; /* dst = (reverse alpha) * dst + alpha * src */
+                else    
+                    *d = (*d * (0x1010101 - *a) + (*a * *s)) >> 24;
             }
         }
     }

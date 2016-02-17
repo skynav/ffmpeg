@@ -288,6 +288,7 @@ void avfilter_register_all(void)
     /* multimedia sources */
     REGISTER_FILTER(AMOVIE,         amovie,         avsrc);
     REGISTER_FILTER(MOVIE,          movie,          avsrc);
+    REGISTER_FILTER(TTPI,           ttpi,           vf);
 
 #if FF_API_AVFILTERBUFFER
     REGISTER_FILTER_UNCONDITIONAL(vsink_ffbuffersink);

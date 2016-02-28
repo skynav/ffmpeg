@@ -28,7 +28,7 @@
  * three paths:
  *
  * (1) a path to zip file that contains the TTPI archive, with an entry
- * named manifest.xml at the top level;
+ * named manifest.xml at the top level (not yet supported);
  * (2) a path to a directory that contains the TTPI archive, with an
  * entry named manifest.xml at the top level;
  * (3) a path to a manifest file that contains reative path names
@@ -50,17 +50,18 @@
  * Multiple images may apply to a given video frame, in which case
  * they should not intersect (spatially).
  *
- * The XML manifest file is parsed using the libxml2 library and minizip.
- * Make sure to configue the ffmpeg build with proper options:
+ * The XML manifest file is parsed using the libxml2 library.  Make
+ * sure to configue the ffmpeg build with proper options or
+ * equivalent:
  *
  * configure \
- * --extra-cflags="-I/usr/include/libxml2 -I/usr/include/minizip" \
- * --extra-ldflags="-lxml2 -lminizip"
+ * --extra-cflags="-I/usr/include/libxml2 \
+ * --extra-ldflags="-lxml2
  *
  * Check these flags using pkg-config as follows:
  *
- * pkg-config --cflags libxml-2.0 minizip
- * pkg-config --libs libxml-2.0 minizip
+ * pkg-config --cflags libxml-2.0
+ * pkg-config --libs libxml-2.0
  *
  */
 
@@ -88,7 +89,11 @@
 
 #include <libxml/xmlmemory.h>
 #include <libxml/parser.h>
+
+#define MINIZIP 0
+#if MINIZIP
 #include <minizip/unzip.h>
+#endif // MINIZIP
 
 #if HAVE_UNISTD_H
 #include <unistd.h>
@@ -140,7 +145,7 @@ typedef struct TTPI_Context_s
 
 } TTPI_Context;
 
-static char *ttpi_unzip(const char *url, char *url_dir); /* miniuzip stuff */
+// static char *ttpi_unzip(const char *url, char *url_dir); /* miniuzip stuff */
 
 /**
  * ttpi_str2xy() - parse a string representing two numbers in form "NNpx NNpx"
@@ -175,7 +180,7 @@ static int ttpi_str2xy(const char *str, int *x, int *y)
  */
 static int64_t ttpi_str2pts(const char *str)
 {
-    int hour, min, sec, msec;
+    int hour = 0, min = 0, sec = 0, msec = 0;
     int64_t usec = 0; /* millisecond (= 1000 microseconds) */
     int ret = 0;
 
@@ -433,9 +438,12 @@ static int config_input(AVFilterLink *inlink)
     int w, h;
     int er = 0; /* error flag for sanity check */
     int i, ret = 0;
-    int remove = 0; /* remove path if taken from zip file */
     char *ext = NULL; /* file extension */
+    int nDecodes = 0;
+#if MINIZIP
+    int remove = 0; /* remove path if taken from zip file */
     char *pre = NULL; /* file extension */
+#endif // MINIZIP
 
     url = s->file;
 
@@ -446,21 +454,23 @@ static int config_input(AVFilterLink *inlink)
         return 0;
     }
 
+#if MINIZIP
     /* check what kind of file input */
     remove = 0;
     pre = strdup(url);
 
-    /* in case od .zip file, unzip it first to a temprary folder (now in /tmp) */
+    /* in case of .zip file, unzip it first to a temprary folder (now in /tmp) */
     if ((ext = strrchr(pre, '.')))
     {
         if (!strcmp(ext, ".zip"))
         {
-            if ((url = ttpi_unzip(url, NULL))) /* NULL: unzip in /tmp */
+            if ((url = ttpi_unzip(url, NULL))) // NULL: unzip in /tmp
                 remove = 1;
         }
     }
     if (pre)
         free(pre);
+#endif // MINIZIP
 
 #if HAVE_LSTAT
 
@@ -544,6 +554,9 @@ static int config_input(AVFilterLink *inlink)
 
         if ((ret = ff_load_image(data, linesize, &w, &h, &format, path, ctx)) >= 0)
         {
+            /* update decode count for verbose logging */
+            ++nDecodes;
+
             /* one single avframe per image */
             frame = av_frame_alloc();
 
@@ -593,6 +606,7 @@ static int config_input(AVFilterLink *inlink)
             /* add the frame to the events list */
             e->data = (void *) frame;
 
+#if MINIZIP
             if (remove) /* was from zip file, remove file */
             {
                 if (!(unlink(path)))
@@ -600,8 +614,14 @@ static int config_input(AVFilterLink *inlink)
                 else
                     av_log(ctx, AV_LOG_VERBOSE, "rm NO: %s\n", path);
             }
+#endif // MINIZIP
         }
     }
+
+    av_log(ctx, AV_LOG_VERBOSE, "decoded image count: %d\n", nDecodes);
+
+    
+#if MINIZIP
     if (remove) /* was from zip file, remove temporary directory */
     {
        if (!(rmdir(url)))
@@ -609,6 +629,7 @@ static int config_input(AVFilterLink *inlink)
        else
            av_log(ctx, AV_LOG_VERBOSE, "rmdir NO: %s\n", s->dir);
     }
+#endif // MINIZIP
 
     return 0;
 }
@@ -713,7 +734,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
 
 static const AVOption ttpi_options[] =
 {
-    { "file", "get manifest from file(.xml), folder or zipped folder(.zio).",  OFFSET(file), AV_OPT_TYPE_STRING, {.str=NULL}, .flags = FLAGS },
+    { "file", "get manifest from file(.xml) or folder.",  OFFSET(file), AV_OPT_TYPE_STRING, {.str=NULL}, .flags = FLAGS },
     { NULL }
 };
 
@@ -755,6 +776,7 @@ AVFilter ff_vf_ttpi =
 
 /* minizip stuff */
 
+#if MINIZIP
 #define ZIP_FILE_SIZE 1024
 #define ZIP_READ_SIZE 16*1024
 
@@ -883,5 +905,6 @@ static char *ttpi_unzip(const char *url, char *url_dir)
 
     return resp;
 }
+#endif // MINIZIP
 
 #endif /* CONFIG_TTPI_FILTER */

@@ -50,17 +50,18 @@
  * Multiple images may apply to a given video frame, in which case
  * they should not intersect (spatially).
  *
- * The XML manifest file is parsed using the libxml2 library and minizip.
- * Make sure to configue the ffmpeg build with proper options:
+ * The XML manifest file is parsed using the libxml2 library.  Make
+ * sure to configue the ffmpeg build with proper options or
+ * equivalent:
  *
  * configure \
- * --extra-cflags="-I/usr/include/libxml2 -I/usr/include/minizip" \
- * --extra-ldflags="-lxml2 -lminizip"
+ * --extra-cflags="-I/usr/include/libxml2 \
+ * --extra-ldflags="-lxml2
  *
  * Check these flags using pkg-config as follows:
  *
- * pkg-config --cflags libxml-2.0 minizip
- * pkg-config --libs libxml-2.0 minizip
+ * pkg-config --cflags libxml-2.0
+ * pkg-config --libs libxml-2.0
  *
  */
 
@@ -88,7 +89,10 @@
 
 #include <libxml/xmlmemory.h>
 #include <libxml/parser.h>
-#include <minizip/unzip.h>
+
+#if CONFIG_ZLIB
+#include <zlib.h>
+#endif /* CONFIG_ZLIB */
 
 #if HAVE_UNISTD_H
 #include <unistd.h>
@@ -140,7 +144,8 @@ typedef struct TTPI_Context_s
 
 } TTPI_Context;
 
-static char *ttpi_unzip(const char *url, char *url_dir); /* miniuzip stuff */
+/* unzip the content of pkzip archive file to temporary directory */
+static char *ttpi_unzip(const char *url, char *url_dir); /* unzip stuff */
 
 /**
  * ttpi_str2xy() - parse a string representing two numbers in form "NNpx NNpx"
@@ -175,7 +180,7 @@ static int ttpi_str2xy(const char *str, int *x, int *y)
  */
 static int64_t ttpi_str2pts(const char *str)
 {
-    int hour, min, sec, msec;
+    int hour = 0, min = 0, sec = 0, msec = 0;
     int64_t usec = 0; /* millisecond (= 1000 microseconds) */
     int ret = 0;
 
@@ -433,9 +438,12 @@ static int config_input(AVFilterLink *inlink)
     int w, h;
     int er = 0; /* error flag for sanity check */
     int i, ret = 0;
-    int remove = 0; /* remove path if taken from zip file */
     char *ext = NULL; /* file extension */
+    int nDecodes = 0;
+#if CONFIG_ZLIB
+    int remove = 0;   /* remove path if taken from zip file */
     char *pre = NULL; /* file extension */
+#endif /* CONFIG_ZLIB */
 
     url = s->file;
 
@@ -446,38 +454,40 @@ static int config_input(AVFilterLink *inlink)
         return 0;
     }
 
+#if CONFIG_ZLIB
     /* check what kind of file input */
     remove = 0;
     pre = strdup(url);
 
-    /* in case od .zip file, unzip it first to a temprary folder (now in /tmp) */
+    /* in case of .zip file, unzip it first to a temprary folder (now in /tmp) */
     if ((ext = strrchr(pre, '.')))
     {
         if (!strcmp(ext, ".zip"))
         {
-            if ((url = ttpi_unzip(url, NULL))) /* NULL: unzip in /tmp */
+            if ((url = ttpi_unzip(url, NULL))) // NULL: unzip in /tmp
                 remove = 1;
         }
     }
     if (pre)
         free(pre);
+#endif /* CONFIG_ZLIB */
 
 #if HAVE_LSTAT
 
     /* if input is directory, get all from directory */
     /* check file/dir type */
+
     if (!lstat(url, &st))
     {
         if (S_ISDIR(st.st_mode))
         {
             DIR *dir;
 
-            if (url && !chdir(url))
+            if (url)
             {
                 if ((dir = opendir(url)))
                 {
                     struct dirent *xml = NULL;
-        
                     while ((xml = readdir(dir)))
                     {
                         if (!(ext = strrchr(xml->d_name, '.')))
@@ -488,6 +498,14 @@ static int config_input(AVFilterLink *inlink)
 
                         sprintf(path, "%s/%s", url, xml->d_name);
 
+                        /* save directory of manifest file, and manifest file */
+                        s->dir = strdup(url);
+                        if (s->file)
+                            free(s->file);
+                        s->file = strdup(path);
+
+                        if (url)
+                            free(url);
                         url = path;
                         break;
                     }
@@ -506,19 +524,13 @@ static int config_input(AVFilterLink *inlink)
     }
 
     /* url is .xml manifest file here */
-
     if (!(s->manifest = ttpi_read_ttml2_manifest(url)))
     {
         av_log(ctx, AV_LOG_ERROR, "Cannot load the manifest file %s.\n", url);
         ttpi_uninit(ctx);
         return 0;
     }
-
 #endif /* HAVE_LSTAT */
-
-    /* save directory of manifest file */
-    sprintf(path, "%s", url);
-    s->dir = strdup(dirname(path));
 
     if ((s->manifest->w != inlink->w) || (s->manifest->h != inlink->h))
     {
@@ -544,6 +556,9 @@ static int config_input(AVFilterLink *inlink)
 
         if ((ret = ff_load_image(data, linesize, &w, &h, &format, path, ctx)) >= 0)
         {
+            /* update decode count for verbose logging */
+            ++nDecodes;
+
             /* one single avframe per image */
             frame = av_frame_alloc();
 
@@ -573,7 +588,7 @@ static int config_input(AVFilterLink *inlink)
 
             if ((y + h) < -inlink->h)    /* y of image outside the video frame left  */
                 y = 1, er++;
-   
+
             if (x < 0)
                 x = 0, er++;
 
@@ -593,22 +608,28 @@ static int config_input(AVFilterLink *inlink)
             /* add the frame to the events list */
             e->data = (void *) frame;
 
+#if CONFIG_ZLIB
             if (remove) /* was from zip file, remove file */
             {
-                if (!(unlink(path)))
-                    av_log(ctx, AV_LOG_VERBOSE, "rm OK: %s\n", path);
-                else
-                    av_log(ctx, AV_LOG_VERBOSE, "rm NO: %s\n", path);
+                if ((er = unlink(path)) != 0)
+                    av_log(ctx, AV_LOG_VERBOSE, "rm failed (0x%x): %s\n", er, path);
             }
+#endif /* CONFIG_ZLIB */
         }
     }
+
+    av_log(ctx, AV_LOG_VERBOSE, "decoded image count: %d\n", nDecodes);
+
+#if CONFIG_ZLIB
     if (remove) /* was from zip file, remove temporary directory */
     {
-       if (!(rmdir(url)))
-           av_log(ctx, AV_LOG_VERBOSE, "rmdir OK: %s\n", s->dir);
-       else
-           av_log(ctx, AV_LOG_VERBOSE, "rmdir NO: %s\n", s->dir);
+       if ((er = unlink(s->file)) != 0)
+           av_log(ctx, AV_LOG_VERBOSE, "rm failed (0x%x): %s\n", er, s->file);
+
+       if ((er = rmdir(s->dir)) != 0)
+           av_log(ctx, AV_LOG_VERBOSE, "rmdir failed (0x%x): %s\n", er, s->dir);
     }
+#endif /* CONFIG_ZLIB */
 
     return 0;
 }
@@ -643,7 +664,7 @@ static void ttpi_blend_frame(
 
                 if (*a == 0xff) /* opaque */
                     *d = *s;
-                else    
+                else
                     *d = (*d * (0x1010101 - *a) + (*a * *s)) >> 24;
             }
         }
@@ -713,7 +734,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
 
 static const AVOption ttpi_options[] =
 {
-    { "file", "get manifest from file(.xml), folder or zipped folder(.zio).",  OFFSET(file), AV_OPT_TYPE_STRING, {.str=NULL}, .flags = FLAGS },
+    { "file", "get manifest from file(.xml) or folder.",  OFFSET(file), AV_OPT_TYPE_STRING, {.str=NULL}, .flags = FLAGS },
     { NULL }
 };
 
@@ -753,135 +774,251 @@ AVFilter ff_vf_ttpi =
     .flags         = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC
 };
 
-/* minizip stuff */
+
+#if CONFIG_ZLIB
+
+/* zlib stuff */
 
 #define ZIP_FILE_SIZE 1024
 #define ZIP_READ_SIZE 16*1024
 
-static char *ttpi_unzip(const char *url, char *url_dir)
+/* As https://pkware.cachefly.net/webdocs/casestudies/APPNOTE.TXT */
+/* 4.3.7  Local file header structure */
+
+/* make sure it is packed; avoid memery padding, header is loaded in one read */
+typedef struct __attribute__ ((__packed__)) pkzip_header_s {
+    uint32_t signature;
+    uint16_t version;
+    uint16_t flags;
+    uint16_t compression;
+    uint16_t mod_time;
+    uint16_t mod_date;
+    uint32_t crc32;
+    uint32_t compressed_size;
+    uint32_t uncompressed_size;
+    uint16_t file_name_len;
+    uint16_t extra_field_len;
+} pkzip_header_t;
+
+/* pass destination parameters */
+typedef struct dest_s {
+    char *dir;
+    char *prefix;
+    char *url;
+} dest_t;
+
+/* get data and uncompress it using zlib */
+static void *pkzip_get_data(FILE *fp, pkzip_header_t *header)
 {
-    /* Open the zip file */
-    unzFile *zipfile = NULL;
-    unz_global_info global_info;
-    unz_file_info file_info;
+    void *data = NULL;
+    uint8_t *bytes = NULL;
+    uint8_t buffer[ZIP_READ_SIZE];
+    long rest_read_compressed, rest_read_uncompressed;
+    z_stream strm;
+    int ret;
 
-    /* Buffer to hold data read from the zip file. */
-    const char dir_delimter = '/'; 
-    char read_buffer[ZIP_READ_SIZE];
-    char dest[ZIP_FILE_SIZE];
-    char file[ZIP_FILE_SIZE];
-    size_t file_length;
-    FILE *out;
-    int error = UNZ_OK;
-    uLong i;
-    char *dir = NULL;
-    char *resp = NULL;
-    char *prefix = NULL;
-
-    if (!(zipfile = unzOpen(url)))
+    if (!((header->compression == 0) || (header->compression == 8)))
     {
+        /* only deflated or uncompressed supported */
         return NULL;
     }
 
-    if (unzGetGlobalInfo(zipfile, &global_info) != UNZ_OK)
+    if (!(data = calloc(1, header->uncompressed_size)))
     {
-        unzClose(zipfile);
+        /* cannot calloc data */
         return NULL;
     }
 
-    prefix = strdup("ttpi_XXXXXX");
-    i = mkstemp(prefix);
-
-    if (url_dir)               
-        dir = strdup(url_dir);
-    else
-        dir = strdup("/tmp");
- 
-    /* Loop to extract all files */
-    for (i = 0; i < global_info.number_entry; i++)
+    if (header->compression == 0) /* stored (no compression) */
     {
-        /* Get info about current file. */
-        memset(file, 0, ZIP_FILE_SIZE);
-        if (unzGetCurrentFileInfo(zipfile, &file_info, file, ZIP_FILE_SIZE, NULL, 0, NULL, 0) != UNZ_OK)
+        if (fread(data, 1, header->uncompressed_size, fp) < header->uncompressed_size)
         {
-            unzClose(zipfile);
+            /* data read failed */
+            free(data);
+            return NULL;
+        }
+    }
+    else if (header->compression == 8) /* deflate - use zlib */
+    {
+        bytes = (uint8_t *) data;
+        strm.zalloc = Z_NULL;
+        strm.zfree  = Z_NULL;
+        strm.opaque = Z_NULL;
+
+        strm.avail_in = 0;
+        strm.next_in  = Z_NULL;
+
+        /* inflateInit2 raw data */
+        if ((ret = inflateInit2(&strm, -MAX_WBITS)) != Z_OK)
+        {
+            free(data);
             return NULL;
         }
 
-        /* Check if this entry is a directory or file. */
-        file_length = strlen(file);
-        if (file[file_length-1] == dir_delimter)
+        /* inflate data */
+        for (rest_read_compressed = header->compressed_size,
+            rest_read_uncompressed = header->uncompressed_size;
+            rest_read_compressed && rest_read_uncompressed && ret != Z_STREAM_END;
+            rest_read_compressed -= strm.avail_in)
         {
-            /* Entry is a directory, so create it. */
-            sprintf(dest, "%s/%s_%s", dir, prefix, file);
+            strm.avail_in = fread(buffer, 1, (sizeof(buffer) < rest_read_compressed)
+                ? sizeof(buffer)
+                : rest_read_compressed, fp);
 
-            if ((mkdir(dest, S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH)))
+            if (strm.avail_in == 0 || ferror(fp))
             {
-                unzClose(zipfile);
+                inflateEnd(&strm);
+                free(data);
                 return NULL;
             }
-            resp = strdup(dest);
+
+            strm.next_in = buffer;
+            strm.avail_out = rest_read_uncompressed;
+            strm.next_out = bytes;
+
+            rest_read_compressed -= strm.avail_in;
+
+            ret = inflate(&strm, Z_NO_FLUSH);
+
+            if (ret == Z_STREAM_ERROR ||
+                ret == Z_NEED_DICT ||
+                ret == Z_DATA_ERROR ||
+                ret == Z_MEM_ERROR)
+            {
+                inflateEnd(&strm);
+                free(data);
+                return NULL;
+            }
+
+            bytes += rest_read_uncompressed - strm.avail_out;
+            rest_read_uncompressed = strm.avail_out;
         }
-        else
+        inflateEnd(&strm);
+    }
+    return data;
+}
+
+static int pkzip_parse_file(FILE *fp, dest_t *dest)
+{
+    uint8_t *data = NULL;
+    pkzip_header_t header;
+    char file[ZIP_FILE_SIZE];
+    char path[ZIP_FILE_SIZE*2];
+    size_t size = sizeof(pkzip_header_t);
+    size_t got = 0;
+    FILE *out;
+    const char dir_delimter = '/';
+
+    if ((got = fread(&header, 1, size, fp)) < size)
+    {
+        /* header read failed */
+        return -1;
+    }
+
+    if (header.flags & 1) /* bit 0 set; we do not process encrypted files */
+    {
+        /* encrypted file */
+        return -1;
+    }
+
+    /* if wrong signature or end of headers - return */
+    if (header.signature != 0x04034b50) /* 4.3.7 Local file header */
+        return -1;
+
+    /* get file name */
+    memset(file, 0, ZIP_FILE_SIZE);
+    if ((got = fread(file, 1, header.file_name_len, fp)) < header.file_name_len)
+    {
+        /* file name read failed */
+        return -1;
+    }
+
+    /* skip extra_field data, if any */
+    if (header.extra_field_len)
+    {
+        if (fseek(fp, header.extra_field_len, SEEK_CUR))
         {
-            /* Entry is a file, so extract it. */
-            if (unzOpenCurrentFile(zipfile) != UNZ_OK)
-            {
-                unzClose(zipfile);
-                return NULL;
-            }
-
-            /* Open a file to write out the data. */
-            sprintf(dest, "%s/%s_%s", dir, prefix, file);
-            if (!(out = fopen(dest, "wb")))
-            {
-                unzCloseCurrentFile(zipfile);
-                unzClose(zipfile);
-                return NULL;
-            }
-
-            error = UNZ_OK;
-            do
-            {
-                if ((error = unzReadCurrentFile(zipfile, read_buffer, ZIP_READ_SIZE)) < 0)
-                {
-                    unzCloseCurrentFile(zipfile);
-                    unzClose(zipfile);
-                    return NULL;
-                }
-
-                /* Write data to file. */
-                if (error > 0)
-                {
-                    /* You should check return of fwrite... */
-                    fwrite(read_buffer, error, 1, out);
-                }
-            } while (error > 0);
-
-            fclose(out);
-        }
-
-        unzCloseCurrentFile(zipfile);
-
-        /* Go the the next entry listed in the zip file. */
-        if ((i+1) < global_info.number_entry)
-        {
-            if (unzGoToNextFile(zipfile) != UNZ_OK)
-            {
-                unzClose(zipfile);
-                return NULL;
-            }
+            /* cannot seek */
+            return -1;
         }
     }
-    unzClose(zipfile);
 
-    if (prefix)
-        free(prefix);
+    if (header.uncompressed_size) /* get data if any */
+    {
+        if (!(data = (uint8_t *) pkzip_get_data(fp, &header)))
+        {
+            /* cannot read data */
+            return -1;
+        }
+    }
+    if (file[header.file_name_len-1] == dir_delimter)
+    {
+        file[header.file_name_len-1] = 0; /* remove delimeter */
+        sprintf(path, "%s/%s_%s", dest->dir, dest->prefix, file);
+        dest->url = strdup(path); /* must be freed on exit */
 
-    if (dir)
-        free(dir);
+        if ((mkdir(dest->url, S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH)))
+        {
+            /* cannot create directory */
+            /* may allready exist */
+        }
+        if (data)
+            free(data);
+        return 0;
+    }
 
-    return resp;
+    if (data)
+    {
+        sprintf(path, "%s/%s_%s", dest->dir, dest->prefix, file);
+        if ((out = fopen(path, "wb")) != NULL)
+        {
+            fwrite(data, 1, header.uncompressed_size, out);
+            fclose(out);
+        }
+        free(data);
+    }
+    return 0;
 }
+
+static char *ttpi_unzip(const char *url, char *url_dir)
+{
+    FILE *fp;
+    dest_t dest;
+    int fi = 0;
+
+    if (!(fp = fopen(url, "rb")))
+    {
+        /* cannot open */
+        return NULL;
+    }
+
+    /* just generate the name and delete created file */
+    dest.prefix = strdup("ttpi_XXXXXX");
+    if ((fi = mkstemp(dest.prefix)))
+    {
+        close(fi);
+        unlink(dest.prefix);
+    }
+
+    if (url_dir)
+        dest.dir = strdup(url_dir);
+    else
+        dest.dir = strdup("/tmp");
+
+    while (!pkzip_parse_file(fp, &dest))
+    ;
+
+    fclose(fp);
+
+    if (dest.prefix)
+        free(dest.prefix);
+
+    if (dest.dir)
+        free(dest.dir);
+
+    return dest.url;
+}
+
+#endif /* CONFIG_ZLIB */
 
 #endif /* CONFIG_TTPI_FILTER */

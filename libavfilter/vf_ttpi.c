@@ -488,6 +488,7 @@ static int config_input(AVFilterLink *inlink)
                 if ((dir = opendir(url)))
                 {
                     struct dirent *xml = NULL;
+
                     while ((xml = readdir(dir)))
                     {
                         if (!(ext = strrchr(xml->d_name, '.')))
@@ -499,9 +500,7 @@ static int config_input(AVFilterLink *inlink)
                         sprintf(path, "%s/%s", url, xml->d_name);
 
                         /* save directory of manifest file, and manifest file */
-                        s->dir = strdup(url);
-                        if (s->file)
-                            free(s->file);
+                        s->dir  = strdup(url);
                         s->file = strdup(path);
 
                         if (url)
@@ -530,6 +529,13 @@ static int config_input(AVFilterLink *inlink)
         ttpi_uninit(ctx);
         return 0;
     }
+    /* save directory of manifest file */
+    if (!s->dir)
+    {
+        sprintf(path, "%s", url);
+        s->dir = strdup(dirname(path));
+    }
+
 #endif /* HAVE_LSTAT */
 
     if ((s->manifest->w != inlink->w) || (s->manifest->h != inlink->h))

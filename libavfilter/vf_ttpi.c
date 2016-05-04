@@ -136,6 +136,7 @@ typedef struct TTPI_Context_s
 {
     const AVClass *class;
     char *file;     /* file path of the ttpi manifest */
+    int64_t delayusec; /* time offset to be applied to timestamps in the manifest file, can be negative */
     char *dir;      /* directory where from ttpi manifest was taken */
 
     TTPI_Manifest *manifest; /* TTPI array taken from TTML2 manifest */
@@ -545,7 +546,7 @@ static int config_input(AVFilterLink *inlink)
     }
 
     /* in case stream has no timestamps! */
-    s->frame_time  = 1.0 / (double) (inlink->frame_rate.num / inlink->frame_rate.den);
+    s->frame_time  = 1.0 /  ((double)inlink->frame_rate.num / inlink->frame_rate.den);
     s->frame_time *= 1000000.0;
 
     m = s->manifest;
@@ -706,7 +707,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
     {
         e = &m->events[i];
 
-        if ((pts >= e->begin) && (pts < e->end))
+        if ((pts >= (e->begin + s->delayusec)) && (pts < (e->end + s->delayusec)))
         {
             AVFrame *f = (AVFrame *) e->data;
 
@@ -741,6 +742,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
 static const AVOption ttpi_options[] =
 {
     { "file", "get manifest from file(.xml) or folder.",  OFFSET(file), AV_OPT_TYPE_STRING, {.str=NULL}, .flags = FLAGS },
+    { "delayusec", "Optional delay (+/- microseconds) to the time stamps in manifest.", OFFSET(delayusec), AV_OPT_TYPE_INT64, {.i64=0}, .min = -36000000000.0, .max = 36000000000.0, .flags = FLAGS },
     { NULL }
 };
 

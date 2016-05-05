@@ -136,11 +136,16 @@ typedef struct TTPI_Context_s
 {
     const AVClass *class;
     char *file;     /* file path of the ttpi manifest */
+    int64_t delayusec; /* time offset to be applied to timestamps in the manifest file, can be negative */
     char *dir;      /* directory where from ttpi manifest was taken */
 
     TTPI_Manifest *manifest; /* TTPI array taken from TTML2 manifest */
 
     double frame_time; /* in case video has no timestamps */
+
+    enum AVPixelFormat videoFrameFormat; /* YUV format being used in the raw video */
+    int  bitDepth; /*8 or 10, bits per sample per plane */
+    int  chromaVertSampling; /* YUV422 -> 0, YUV420 -> 1 */
 
 } TTPI_Context;
 
@@ -430,7 +435,9 @@ static int config_input(AVFilterLink *inlink)
     uint8_t *data[4] = { NULL };
     int linesize[4];
 
-    enum AVPixelFormat format;
+    double xScaleRatio = 1.0, yScaleRatio = 1.0;
+
+    enum AVPixelFormat pngformat, yuvaFormat;
     char *url = NULL;
     char path[2048];
     struct stat st;
@@ -540,15 +547,54 @@ static int config_input(AVFilterLink *inlink)
 
     if ((s->manifest->w != inlink->w) || (s->manifest->h != inlink->h))
     {
-        av_log(ctx, AV_LOG_ERROR, "Extents of manifest and video differ: %dx%d (%dx%d).\n",
-            s->manifest->w, s->manifest->h, inlink->w, inlink->h);
+        xScaleRatio = inlink->w * 1.0 / s->manifest->w; //Responsibility of maintaining reasonable bounds is left to the higher application.
+        yScaleRatio = inlink->h * 1.0 / s->manifest->h;
     }
 
     /* in case stream has no timestamps! */
-    s->frame_time  = 1.0 / (double) (inlink->frame_rate.num / inlink->frame_rate.den);
+    s->frame_time  = 1.0 /  ((double)inlink->frame_rate.num / inlink->frame_rate.den);
     s->frame_time *= 1000000.0;
 
     m = s->manifest;
+
+    s->videoFrameFormat = inlink->format;
+
+    /* Check if the input format is supported */
+    if( (s->videoFrameFormat != AV_PIX_FMT_YUV420P) &&
+        (s->videoFrameFormat != AV_PIX_FMT_YUV422P) &&
+        (s->videoFrameFormat != AV_PIX_FMT_YUV420P10LE) &&
+        (s->videoFrameFormat != AV_PIX_FMT_YUV422P10LE) )
+    {
+        av_log(ctx, AV_LOG_ERROR, "TTPI filter: Unsupported video format %d.\n", s->videoFrameFormat);
+        ttpi_uninit(ctx);
+        return 0;
+    }
+    else
+    {
+        switch(s->videoFrameFormat)
+        {
+        case AV_PIX_FMT_YUV420P:
+                 yuvaFormat = AV_PIX_FMT_YUVA420P;
+                 s->chromaVertSampling = 1;
+                 s->bitDepth = 8;
+                 break;
+        case AV_PIX_FMT_YUV422P:
+                 yuvaFormat = AV_PIX_FMT_YUVA422P;
+                 s->chromaVertSampling = 0;
+                 s->bitDepth = 8;
+                 break;
+        case AV_PIX_FMT_YUV420P10LE:
+                 yuvaFormat = AV_PIX_FMT_YUVA420P10LE;
+                 s->chromaVertSampling = 1;
+                 s->bitDepth = 10;
+                 break;
+        case AV_PIX_FMT_YUV422P10LE:
+                 yuvaFormat = AV_PIX_FMT_YUVA422P10LE;
+                 s->chromaVertSampling = 0;
+                 s->bitDepth = 10;
+                 break;
+        }
+    }
 
     /* load all images and conver them to yuva frames */
     for (i = 0; i < m->count; i++)
@@ -560,10 +606,19 @@ static int config_input(AVFilterLink *inlink)
 
         /* read images (png in this case) using ffmpeg utils (lavfutils.c) */
 
-        if ((ret = ff_load_image(data, linesize, &w, &h, &format, path, ctx)) >= 0)
+        if ((ret = ff_load_image(data, linesize, &w, &h, &pngformat, path, ctx)) >= 0)
         {
             /* update decode count for verbose logging */
             ++nDecodes;
+
+            /* update event to accommodate scaling of subtitles */
+            if((xScaleRatio != 1.0) || (yScaleRatio != 1.0))
+            {
+                e->w = (int32_t)(e->w * xScaleRatio) & 0x7FFFFFFE; // Scale and floor to even value (because of YUV420)
+                e->h = (int32_t)(e->h * yScaleRatio) & 0x7FFFFFFE;
+                e->x = (int32_t)(e->x * xScaleRatio) & 0x7FFFFFFE;
+                e->y = (int32_t)(e->y * yScaleRatio) & 0x7FFFFFFE;
+            }
 
             /* one single avframe per image */
             frame = av_frame_alloc();
@@ -571,7 +626,7 @@ static int config_input(AVFilterLink *inlink)
             /* scale it, but more important - it adds to the frame the apha channel */
 
             if ((ret = ff_scale_image(frame->data, frame->linesize, e->w, e->h,
-                AV_PIX_FMT_YUVA420P, data, linesize, w, h, format, ctx)) < 0)
+                     yuvaFormat, data, linesize, w, h, pngformat, ctx)) < 0)
             {
                 av_log(ctx, AV_LOG_ERROR, "Failed to scale image: %s.\n", e->image);
                 av_frame_free(&frame);
@@ -586,14 +641,8 @@ static int config_input(AVFilterLink *inlink)
             if ((x + e->w) >= inlink->w) /* x of image outside the video frame right */
                 x = inlink->w - e->w -1, er++;
 
-            if ((y + h) >= inlink->h)    /* y of image outside the video frame bottom */
-                y = inlink->h - h - 1, er++;
-
-            if ((x + e->w) < -inlink->w) /* x of image outside the video frame left  */
-                x = 1, er++;
-
-            if ((y + h) < -inlink->h)    /* y of image outside the video frame left  */
-                y = 1, er++;
+            if ((y + e->h) >= inlink->h)    /* y of image outside the video frame bottom */
+                y = inlink->h - e->h - 1, er++;
 
             if (x < 0)
                 x = 0, er++;
@@ -644,38 +693,80 @@ static int config_input(AVFilterLink *inlink)
  * ttpi_blend_frame() - copy and blend src image onto dst video frame,
  * with alpha blending
  */
-static void ttpi_blend_frame(
+static void ttpi_blend_frame_8bit(
     uint8_t **dst, int *dst_linesize, /* destination frame data */
     uint8_t **src, int *src_linesize, /* source frame data */
     int x, int y,                     /* destination position */
-    int w, int h)                     /* source dimentions */
+    int w, int h,                     /* source dimentions */
+    int chromaVertSampling)           /* Chroma sampled horizontally or not */
 {
     int i, j, k;
-    int shift = 0;
+    int shiftH = 0, shiftV = 0;
     uint8_t *s = NULL; /* source, destination pointer */
     uint8_t *d = NULL; /* source, destination pointer */
     uint8_t *a = NULL; /* alpha value */
 
     for (i = 0; i < 3; i++) /* planes */
     {
-        shift = i ? 1 : 0;
+        shiftV = i ? chromaVertSampling : 0;
+        shiftH = i ? 1 : 0;
 
         for (j = 0; j < h; j++) /* rows */
         {
             for (k = 0; k < w; k++) /* columns */
             {
                 a = src[3] + (      j         ) * src_linesize[3] + ( k              );
-                s = src[i] + (      j >> shift) * src_linesize[i] + ( k      >> shift);
-                d = dst[i] + ((j + y) >> shift) * dst_linesize[i] + ((k + x) >> shift);
+                s = src[i] + (      j >> shiftV) * src_linesize[i] + ( k      >> shiftH);
+                d = dst[i] + ((j + y) >> shiftV) * dst_linesize[i] + ((k + x) >> shiftH);
 
                 if (*a == 0xff) /* opaque */
                     *d = *s;
                 else
-                    *d = (*d * (0x1010101 - *a) + (*a * *s)) >> 24;
+                    *d = (*d * (0x100 - *a) + (*a * *s)) >> 8;
             }
         }
     }
 }
+
+/**
+ * ttpi_blend_frame() - copy and blend src image onto dst video frame,
+ * with alpha blending
+ */
+static void ttpi_blend_frame_10bit(
+    uint8_t **dst, int *dst_linesize, /* destination frame data */
+    uint8_t **src, int *src_linesize, /* source frame data */
+    int x, int y,                     /* destination position */
+    int w, int h,                     /* source dimentions */
+    int chromaVertSampling)           /* Chroma sampled horizontally or not */
+{
+    int i, j, k;
+    int shiftH = 0, shiftV = 0;
+    uint16_t *s = NULL; /* source, destination pointer */
+    uint16_t *d = NULL; /* source, destination pointer */
+    uint16_t *a = NULL; /* alpha value */
+
+    for (i = 0; i < 3; i++) /* planes */
+    {
+        shiftV = i ? chromaVertSampling : 0;
+        shiftH = i ? 1 : 0;
+
+        for (j = 0; j < h; j++) /* rows */
+        {
+            for (k = 0; k < w; k++) /* columns */
+            {
+                a = ((uint16_t*)(src[3] + (      j         ) * src_linesize[3])) + ( k              );
+                s = ((uint16_t*)(src[i] + (      j >> shiftV) * src_linesize[i])) + ( k      >> shiftH);
+                d = ((uint16_t*)(dst[i] + ((j + y) >> shiftV) * dst_linesize[i])) + ((k + x) >> shiftH);
+
+                if (*a == 0x3ff) /* opaque */
+                    *d = *s;
+                else
+                    *d = (*d * (0x400 - *a) + (*a * *s)) >> 10;
+            }
+        }
+    }
+}
+
 
 static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
 {
@@ -706,7 +797,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
     {
         e = &m->events[i];
 
-        if ((pts >= e->begin) && (pts < e->end))
+        if ((pts >= (e->begin + s->delayusec)) && (pts < (e->end + s->delayusec)))
         {
             AVFrame *f = (AVFrame *) e->data;
 
@@ -724,8 +815,16 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
                 continue;
             }
 
-            ttpi_blend_frame(frame->data, frame->linesize, f->data, f->linesize,
-                e->x, e->y, e->w, e->h);
+            if(s->bitDepth == 8)
+            {
+                ttpi_blend_frame_8bit(frame->data, frame->linesize, f->data, f->linesize,
+                                e->x, e->y, e->w, e->h, s->chromaVertSampling);
+            }
+            else
+            {
+                ttpi_blend_frame_10bit(frame->data, frame->linesize, f->data, f->linesize,
+                                e->x, e->y, e->w, e->h, s->chromaVertSampling);
+            }
         }
     }
 
@@ -741,6 +840,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
 static const AVOption ttpi_options[] =
 {
     { "file", "get manifest from file(.xml) or folder.",  OFFSET(file), AV_OPT_TYPE_STRING, {.str=NULL}, .flags = FLAGS },
+    { "delayusec", "Optional delay (+/- microseconds) to the time stamps in manifest.", OFFSET(delayusec), AV_OPT_TYPE_INT64, {.i64=0}, .min = -36000000000.0, .max = 36000000000.0, .flags = FLAGS },
     { NULL }
 };
 
